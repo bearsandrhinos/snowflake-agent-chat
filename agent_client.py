@@ -9,34 +9,80 @@ from typing import Any, Generator, Optional
 
 import requests
 import snowflake.connector
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
+def _secret_section() -> dict[str, Any]:
+    """Return [snowflake] from Streamlit secrets when available."""
+    try:
+        import streamlit as st
+
+        section = st.secrets.get("snowflake", {})
+        return dict(section) if section else {}
+    except Exception:
+        return {}
+
+
+def _cfg(name: str, default: str = "") -> str:
+    secrets = _secret_section()
+    if name in secrets and secrets[name] not in (None, ""):
+        return str(secrets[name]).strip()
+    return os.getenv(f"SNOWFLAKE_{name.upper()}", default).strip()
+
+
+def _private_key_pem() -> str:
+    secrets = _secret_section()
+    if secrets.get("private_key"):
+        return str(secrets["private_key"]).strip()
+    path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "").strip()
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    pem = os.getenv("SNOWFLAKE_PRIVATE_KEY", "").strip()
+    return pem
+
+
+def _load_private_key_bytes(pem: str) -> bytes:
+    # Streamlit secrets / .env sometimes preserve literal "\n"
+    normalized = pem.replace("\\n", "\n").strip()
+    passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+    password = passphrase.encode() if passphrase else None
+    key = serialization.load_pem_private_key(
+        normalized.encode("utf-8"),
+        password=password,
+        backend=default_backend(),
+    )
+    return key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
 @dataclass
 class AgentConfig:
-    account: str = field(
-        default_factory=lambda: os.getenv("SNOWFLAKE_ACCOUNT", "GQB59211")
-    )
-    user: str = field(default_factory=lambda: os.getenv("SNOWFLAKE_USER", ""))
-    warehouse: str = field(
-        default_factory=lambda: os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
-    )
-    database: str = field(
-        default_factory=lambda: os.getenv("SNOWFLAKE_DATABASE", "ANALYTICS_PROD")
-    )
-    schema: str = field(default_factory=lambda: os.getenv("SNOWFLAKE_SCHEMA", "SAAS"))
-    agent: str = field(
-        default_factory=lambda: os.getenv("SNOWFLAKE_AGENT", "OPPORTUNITIES")
-    )
+    account: str = field(default_factory=lambda: _cfg("account", "GQB59211"))
+    user: str = field(default_factory=lambda: _cfg("user"))
+    warehouse: str = field(default_factory=lambda: _cfg("warehouse", "COMPUTE_WH"))
+    database: str = field(default_factory=lambda: _cfg("database", "ANALYTICS_PROD"))
+    schema: str = field(default_factory=lambda: _cfg("schema", "SAAS"))
+    agent: str = field(default_factory=lambda: _cfg("agent", "OPPORTUNITIES"))
     authenticator: str = field(
-        default_factory=lambda: os.getenv("SNOWFLAKE_AUTHENTICATOR", "externalbrowser")
+        default_factory=lambda: _cfg("authenticator", "externalbrowser")
     )
+    private_key: str = field(default_factory=_private_key_pem)
+
+    @property
+    def uses_key_pair(self) -> bool:
+        return bool(self.private_key.strip())
 
 
 class CortexAgentClient:
-    """Authenticate via browser SSO and call the Cortex Agents API."""
+    """Authenticate to Snowflake and call the Cortex Agents API."""
 
     def __init__(self, config: Optional[AgentConfig] = None):
         self.config = config or AgentConfig()
@@ -45,17 +91,25 @@ class CortexAgentClient:
     def connect(self) -> None:
         if not self.config.user:
             raise ValueError(
-                "SNOWFLAKE_USER is required. Set it in .env or the sidebar."
+                "Snowflake user is required. Set it in Streamlit secrets, .env, "
+                "or the sidebar."
             )
-        self._conn = snowflake.connector.connect(
-            account=self.config.account,
-            user=self.config.user,
-            authenticator=self.config.authenticator,
-            warehouse=self.config.warehouse,
-            database=self.config.database,
-            schema=self.config.schema,
-            client_session_keep_alive=True,
-        )
+
+        kwargs: dict[str, Any] = {
+            "account": self.config.account,
+            "user": self.config.user,
+            "warehouse": self.config.warehouse,
+            "database": self.config.database,
+            "schema": self.config.schema,
+            "client_session_keep_alive": True,
+        }
+
+        if self.config.uses_key_pair:
+            kwargs["private_key"] = _load_private_key_bytes(self.config.private_key)
+        else:
+            kwargs["authenticator"] = self.config.authenticator or "externalbrowser"
+
+        self._conn = snowflake.connector.connect(**kwargs)
 
     @property
     def connected(self) -> bool:

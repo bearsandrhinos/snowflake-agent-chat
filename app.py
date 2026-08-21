@@ -26,6 +26,8 @@ def init_state() -> None:
         "parent_message_id": 0,
         "client": None,
         "connected": False,
+        "connect_error": None,
+        "auto_connect_attempted": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -37,6 +39,50 @@ def get_client() -> CortexAgentClient:
     if client is None:
         raise RuntimeError("Not connected to Snowflake.")
     return client
+
+
+def set_client(client: CortexAgentClient) -> None:
+    old = st.session_state.client
+    if old is not None and old is not client:
+        try:
+            old.close()
+        except Exception:
+            pass
+    st.session_state.client = client
+    st.session_state.connected = True
+    st.session_state.connect_error = None
+    st.session_state.thread_id = None
+    st.session_state.parent_message_id = 0
+
+
+def clear_client() -> None:
+    if st.session_state.client is not None:
+        try:
+            st.session_state.client.close()
+        except Exception:
+            pass
+    st.session_state.client = None
+    st.session_state.connected = False
+
+
+def ensure_key_pair_connection() -> None:
+    """Auto-connect when Streamlit secrets / env provide a private key."""
+    config = AgentConfig()
+    if not config.uses_key_pair:
+        return
+    if st.session_state.connected and st.session_state.client is not None:
+        return
+    if st.session_state.auto_connect_attempted and st.session_state.connect_error:
+        return
+
+    st.session_state.auto_connect_attempted = True
+    try:
+        client = CortexAgentClient(config)
+        client.connect()
+        set_client(client)
+    except Exception as exc:
+        clear_client()
+        st.session_state.connect_error = str(exc)
 
 
 def visible_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -128,7 +174,6 @@ def collect_agent_response(prompt: str) -> tuple[list[dict[str, Any]], dict[str,
         elif event_name == "response.thinking":
             text = data.get("text", "") if isinstance(data, dict) else ""
             if text:
-                # Prefer the complete thinking block when available.
                 thinking_parts = [text]
         elif event_name == "response.tool_use":
             if isinstance(data, dict):
@@ -169,7 +214,6 @@ def collect_agent_response(prompt: str) -> tuple[list[dict[str, Any]], dict[str,
             if message_id is not None:
                 st.session_state.parent_message_id = int(message_id)
 
-            # Fall back to thinking embedded in the final content if deltas were empty.
             if not thinking_parts:
                 for item in final_content:
                     if item.get("type") == "thinking":
@@ -194,59 +238,53 @@ def sidebar() -> None:
     config = AgentConfig()
     with st.sidebar:
         st.header("Connection")
-        user = st.text_input("Email", value=config.user or "")
-        st.caption(
-            f"`{config.database}.{config.schema}.{config.agent}` · Auth: browser SSO"
-        )
+        st.caption(f"`{config.database}.{config.schema}.{config.agent}`")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            connect = st.button("Connect", type="primary", use_container_width=True)
-        with col2:
-            disconnect = st.button("Disconnect", use_container_width=True)
+        if config.uses_key_pair:
+            st.caption("Auth: key-pair (Streamlit secrets)")
+            if st.session_state.connect_error:
+                st.error(f"Connection failed: {st.session_state.connect_error}")
+                if st.button("Retry connect", use_container_width=True):
+                    st.session_state.auto_connect_attempted = False
+                    st.session_state.connect_error = None
+                    st.rerun()
+        else:
+            st.caption("Auth: browser SSO")
+            user = st.text_input("Email", value=config.user or "")
+            col1, col2 = st.columns(2)
+            with col1:
+                connect = st.button("Connect", type="primary", use_container_width=True)
+            with col2:
+                disconnect = st.button("Disconnect", use_container_width=True)
 
-        if connect:
-            if not user.strip():
-                st.error("Email is required.")
-            else:
-                client = CortexAgentClient(
-                    AgentConfig(
-                        account=config.account,
-                        user=user.strip(),
-                        warehouse=config.warehouse,
-                        database=config.database,
-                        schema=config.schema,
-                        agent=config.agent,
-                        authenticator=config.authenticator,
+            if connect:
+                if not user.strip():
+                    st.error("Email is required.")
+                else:
+                    client = CortexAgentClient(
+                        AgentConfig(
+                            account=config.account,
+                            user=user.strip(),
+                            warehouse=config.warehouse,
+                            database=config.database,
+                            schema=config.schema,
+                            agent=config.agent,
+                            authenticator="externalbrowser",
+                            private_key="",
+                        )
                     )
-                )
-                try:
-                    with st.spinner("Opening browser for Snowflake SSO…"):
-                        client.connect()
-                    old = st.session_state.client
-                    if old is not None:
-                        try:
-                            old.close()
-                        except Exception:
-                            pass
-                    st.session_state.client = client
-                    st.session_state.connected = True
-                    st.session_state.thread_id = None
-                    st.session_state.parent_message_id = 0
-                    st.success("Connected")
-                except Exception as exc:
-                    st.session_state.connected = False
-                    st.session_state.client = None
-                    st.error(f"Connection failed: {exc}")
+                    try:
+                        with st.spinner("Opening browser for Snowflake SSO…"):
+                            client.connect()
+                        set_client(client)
+                        st.success("Connected")
+                    except Exception as exc:
+                        clear_client()
+                        st.error(f"Connection failed: {exc}")
 
-        if disconnect and st.session_state.client is not None:
-            try:
-                st.session_state.client.close()
-            except Exception:
-                pass
-            st.session_state.client = None
-            st.session_state.connected = False
-            st.info("Disconnected")
+            if disconnect:
+                clear_client()
+                st.info("Disconnected")
 
         if st.button("Clear chat", use_container_width=True):
             st.session_state.messages = []
@@ -264,6 +302,7 @@ def sidebar() -> None:
 
 def main() -> None:
     init_state()
+    ensure_key_pair_connection()
     sidebar()
 
     st.title("Opportunities Agent")
